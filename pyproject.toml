@@ -1,0 +1,65 @@
+[project]
+name = "dag-cache"
+version = "0.1.0"
+description = "Dynamic cache optimization using dry-run dag."
+readme = "README.md"
+requires-python = ">=3.13, <3.14"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "networkx>=3.6.1",
+    "polars>=1.38.1",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.1",
+    "ty>=0.0.17",
+]
+
+[tool.ty.analysis]
+# Honor type: ignore comments
+respect-type-ignore-comments = true
+
+[tool.ty.rules]
+# Configure rule severity (options: "ignore", "warn", "error")
+# Set stricter defaults for better type safety
+all = "warn"
+possibly-unresolved-reference = "error"
+unresolved-import = "error"
+
+[tool.ty.src]
+# Respect .gitignore files
+respect-ignore-files = true
+
+[tool.ty.terminal]
+# Output format: "full" or "concise"
+output-format = "full"
+error-on-warning = false
+
+[tool.ruff]
+# Ruff linter configuration
+# Using 88 (Black's default) for consistency with the Python ecosystem
+line-length = 88
+
+[tool.ruff.lint]
+# Enable specific rule sets
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "C4",    # flake8-comprehensions
+    "SIM",   # flake8-simplify
+    "RUF",   # ruff-specific rules
+]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # Allow unused imports in __init__.py
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
