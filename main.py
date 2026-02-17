@@ -1,264 +1,21 @@
+"""Demo and comparison scripts for DAG cache planning."""
+
 from __future__ import annotations
 
-from collections.abc import Callable
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from functools import wraps
-from pathlib import Path
-from typing import Any, Literal
-
 import networkx as nx
-import numpy as np
-import polars as pl
 
-
-def generate_dataset(
-    name: str, n_rows: int, n_cols: int, path: Path = Path("./data/")
-) -> DatasetSpec:
-    df = pl.DataFrame({f"col_{i}": np.arange(0, n_rows) for i in range(n_cols)})
-    dataset_spec = DatasetSpec(name=name, path=path / f"{name}.parquet")
-    df.write_parquet(dataset_spec.path, mkdir=True)
-    return dataset_spec
-
-
-def make_mock_data() -> list[DatasetSpec]:
-    if not Path("./data/").exists():
-        Path("./data/").mkdir()
-    return [
-        generate_dataset(name="a", n_rows=100_000, n_cols=50),
-        generate_dataset(name="b", n_rows=200_000, n_cols=100),
-        generate_dataset(name="c", n_rows=50_000, n_cols=30),
-    ]
-
-
-@dataclass(frozen=True)
-class DatasetQuery:
-    dataset: str
-    filters: pl.Expr | None = None
-    columns: list[str] | None = None
-
-
-@dataclass(frozen=True)
-class DatasetSpec:
-    name: str
-    loader: Callable = field(default=lambda path: pl.read_parquet(path))
-    path: Path = Path("./data/name.parquet")
-
-
-@dataclass(frozen=True)
-class Dataset:
-    spec: DatasetSpec
-    data: pl.DataFrame
-
-    query: DatasetQuery | None = None
-
-
-def memory_usage(dataset: Dataset) -> int:
-    return int(dataset.data.estimated_size())
-
-
-def estimate_memory_usage(dataset_spec: DatasetSpec) -> int:
-    estimate = dataset_spec.path.stat().st_size
-    return estimate
-
-
-@dataclass(frozen=True)
-class MemoryEstimate:
-    step: int
-    node_id: str
-    dataset: str
-    estimated_mb: int
-
-
-def estimate_memory_requirements(context: Context) -> list[MemoryEstimate]:
-    assert context.dry_run_enabled, (
-        "Memory estimation should only be run in dry run mode"
-    )
-    order = context.ordered_nodes
-    print(f"Estimating memory requirements for execution order: {order}")
-    memory_requirements = []
-    for step, node_id in enumerate(order):
-        print(f"Estimating memory for node {node_id} at step {step}")
-        node = get_node(node_id, context.node_registry)
-        assert node is not None
-
-        for dataset_name in node.data_dependencies:
-            print(
-                f"Estimating memory for dataset {dataset_name} required by node {node_id}"
-            )
-            dataset_spec = context.data_registry.get_spec(dataset_name)
-            dataset_size = estimate_memory_usage(dataset_spec)
-            print(dataset_size)
-
-            memory_requirements.append(
-                MemoryEstimate(
-                    step=step,
-                    node_id=node_id,
-                    dataset=dataset_name,
-                    estimated_mb=int(dataset_size / (1024 * 1024)),
-                )
-            )
-
-    return memory_requirements
-
-
-@dataclass(frozen=True)
-class CacheCommand:
-    action: Literal["load", "evict"]
-    dataset: str
-
-
-type CachePlan = list[CacheCommand]
-
-
-def plan_cache(estimates: list[MemoryEstimate], max_mb: int) -> CachePlan:
-    plan = []
-    loaded: dict[str, int] = {}
-    current_rss = 0
-    for estimate in estimates:
-        if current_rss + estimate.estimated_mb < max_mb:
-            plan.append(CacheCommand(action="load", dataset=estimate.dataset))
-            loaded[estimate.dataset] = estimate.estimated_mb
-            current_rss += estimate.estimated_mb
-
-        if current_rss + estimate.estimated_mb >= max_mb:
-            for dataset, size in loaded.items():
-                plan.append(CacheCommand(action="evict", dataset=dataset))
-                current_rss -= size
-            loaded = {}
-            plan.append(CacheCommand(action="load", dataset=estimate.dataset))
-            loaded[estimate.dataset] = estimate.estimated_mb
-            current_rss += estimate.estimated_mb
-
-
-@dataclass
-class Cache:
-    data: dict[str, pl.DataFrame] = field(default_factory=dict)
-
-    _hits: dict[str, int] = field(default_factory=dict)
-    _misses: dict[str, int] = field(default_factory=dict)
-
-    def get(self, name: str) -> pl.DataFrame | None:
-        if name not in self.data:
-            self._misses[name] = self._misses.get(name, 0) + 1
-            return None
-
-        self._hits[name] = self._hits.get(name, 0) + 1
-        return self.data[name]
-
-    def set(self, name: str, df: pl.DataFrame) -> None:
-        self.data[name] = df
-
-
-def cached_method(
-    func: Callable[[DataRegistry, str], pl.DataFrame],
-) -> Callable[[DataRegistry, str], pl.DataFrame]:
-    @wraps(func)
-    def wrapper(self: DataRegistry, name: str) -> pl.DataFrame:
-        cached = self._cache.get(name)
-        if cached is not None:
-            return cached
-
-        result = func(self, name)
-        self._cache.set(name, result)
-        return result
-
-    return wrapper
-
-
-@dataclass
-class DataRegistry:
-    datasets: dict[str, DatasetSpec] = field(default_factory=dict)
-    _cache: Cache = field(default_factory=Cache)
-
-    def get_spec(self, name: str) -> DatasetSpec:
-        return self.datasets[name]
-
-    @cached_method
-    def get_data(self, name: str) -> pl.DataFrame:
-        spec = self.get_spec(name)
-        return spec.loader(spec.path)
-
-
-@dataclass(frozen=True)
-class Context:
-    config: dict[str, Any] = field(default_factory=dict)
-
-    dag: nx.DiGraph = field(default_factory=nx.DiGraph)
-    data_registry: DataRegistry = field(default_factory=DataRegistry)
-    node_registry: NodeRegistry = field(default_factory=dict)
-
-    dry_run_enabled: bool = False
-
-    @contextmanager
-    def dry_run(self):
-        original_dry_run_enabled = self.dry_run_enabled
-        object.__setattr__(self, "dry_run_enabled", True)
-        try:
-            yield
-        finally:
-            object.__setattr__(self, "dry_run_enabled", original_dry_run_enabled)
-
-    @property
-    def ordered_nodes(self) -> list[str]:
-        return list(nx.topological_sort(self.dag))
-
-
-def register_dependencies(func):
-    @wraps(func)
-    def wrapper(self: Node, context: Context) -> list[str] | None:
-        if context.dry_run_enabled:
-            print(f"Registering dependencies for node {self.id}")
-            return self.data_dependencies
-
-        return func(self, context)
-
-    return wrapper
-
-
-@dataclass(frozen=True)
-class Node:
-    id: str
-    depends_on: list[str]
-    data_dependencies: list[str] = field(default_factory=list)
-
-    @register_dependencies
-    def run(self, context: Context) -> list[str] | None:
-        print(f"Running node {self.id}")
-
-
-def add_nodes_to_graph(g: nx.DiGraph, nodes: list[Node]):
-    for node in nodes:
-        g.add_node(node.id)
-        for dependency in node.depends_on:
-            g.add_edge(dependency, node.id)
-
-
-type NodeRegistry = dict[str, Node]
-
-
-def get_node(
-    node: str,
-    node_registry: NodeRegistry,
-) -> Node | None:
-    return node_registry[node]
-
-
-def order_graph(g: nx.DiGraph) -> list[str]:
-    # TODO: run in parallel using generations
-    return list(nx.topological_sort(g))
-
-
-def run(context: Context):
-    ordered_nodes = order_graph(context.dag)
-    for node_id in ordered_nodes:
-        node = get_node(node_id, context.node_registry)
-        assert node is not None
-
-        node.run(context)
+from cache import (
+    DataRegistry,
+    estimate_memory_requirements,
+    plan_cache_with_lookahead,
+)
+from dag import Context, Node, NodeRegistry, add_nodes_to_graph
+from data import DatasetQuery, make_mock_data
+from optimization import plan_cache_optimal
 
 
 def make_context() -> Context:
+    """Create a sample execution context for demos."""
     data_registry = DataRegistry()
     for spec in make_mock_data():
         data_registry.datasets[spec.name] = spec
@@ -277,11 +34,107 @@ def make_context() -> Context:
     return context
 
 
-def main():
+def demo_lookahead_planning():
+    """Demonstrate look-ahead cache planning with sample queries."""
     context = make_context()
+
+    # Define queries for each node - showing different access patterns
+    queries = {
+        "1": DatasetQuery(
+            dataset="a", columns=["col_0", "col_1", "col_2"], filters=None
+        ),
+        "2": DatasetQuery(dataset="b", columns=["col_0", "col_1"], filters=None),
+        # Node 3 needs dataset "a" again - overlaps with node 1!
+        "3": DatasetQuery(dataset="a", columns=["col_0", "col_1"], filters=None),
+        "4": DatasetQuery(dataset="b", columns=None, filters=None),  # Needs all of "b"
+    }
+
+    print("=" * 60)
+    print("Generating memory estimates...")
+    print("=" * 60)
+
     with context.dry_run():
-        run(context)
+        estimates = estimate_memory_requirements(context)
+
+    print("\n" + "=" * 60)
+    print("HEURISTIC: Planning cache with look-ahead (budget: 50MB)...")
+    print("=" * 60 + "\n")
+
+    heuristic_plan = plan_cache_with_lookahead(
+        estimates=estimates,
+        queries=queries,
+        max_mb=50,
+        lookahead_window=3,
+    )
+
+    print("\n" + "=" * 60)
+    print("Heuristic Plan:")
+    print("=" * 60)
+    for i, cmd in enumerate(heuristic_plan):
+        print(f"{i}: {cmd.action:6s} {cmd.dataset}")
+
+    print("\n" + "=" * 60)
+    print("OPTIMAL: Planning cache with DP (budget: 50MB)...")
+    print("=" * 60 + "\n")
+
+    optimal_plan, optimal_cost = plan_cache_optimal(
+        estimates=estimates,
+        queries=queries,
+        max_mb=50,
+    )
+
+    print("\n" + "=" * 60)
+    print(f"Optimal Plan (Total I/O cost: {optimal_cost}MB):")
+    print("=" * 60)
+    for i, cmd in enumerate(optimal_plan):
+        print(f"{i}: {cmd.action:6s} {cmd.dataset}")
+
+
+def demo_optimization_comparison():
+    """
+    Compare different optimization approaches for cache planning.
+
+    Demonstrates the trade-offs between:
+    1. Greedy heuristic (fast, approximate)
+    2. Look-ahead heuristic (medium speed, better)
+    3. DP optimal (slower, provably best)
+    4. ILP optimal (slowest, most flexible)
+    """
+    print(
+        """
+╔════════════════════════════════════════════════════════════════╗
+║           CACHE PLANNING OPTIMIZATION COMPARISON               ║
+╠════════════════════════════════════════════════════════════════╣
+║                                                                ║
+║  Approach         | Optimality | Time      | Use When         ║
+║  ────────────────────────────────────────────────────────────  ║
+║  Greedy           | ❌ No      | O(n)      | Quick prototypes ║
+║  Look-ahead       | ❌ No      | O(n×w)    | Production       ║
+║  DP               | ✅ Yes     | O(n×2^k)  | Known queries    ║
+║  ILP              | ✅ Yes     | Exp       | Complex rules    ║
+║                                                                ║
+╠════════════════════════════════════════════════════════════════╣
+║  Key Insights:                                                 ║
+║                                                                ║
+║  • DP is optimal when:                                         ║
+║    - All queries known in advance (offline)                    ║
+║    - State space is tractable (k datasets)                     ║
+║    - Optimal substructure exists (DAGs ✓)                      ║
+║                                                                ║
+║  • ILP is optimal when:                                        ║
+║    - Complex constraints (quotas, SLAs, costs)                 ║
+║    - Willing to wait for solver (seconds to minutes)           ║
+║    - Need certifiable optimality for compliance                ║
+║                                                                ║
+║  • Heuristics are best when:                                   ║
+║    - Need sub-second planning                                  ║
+║    - "Good enough" beats "perfect but slow"                    ║
+║    - Online setting (queries arrive dynamically)               ║
+║                                                                ║
+╚════════════════════════════════════════════════════════════════╝
+    """
+    )
 
 
 if __name__ == "__main__":
-    main()
+    demo_lookahead_planning()
