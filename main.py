@@ -3,8 +3,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import networkx as nx
 import numpy as np
@@ -31,10 +32,29 @@ def make_mock_data() -> list[DatasetSpec]:
 
 
 @dataclass(frozen=True)
+class DatasetQuery:
+    dataset: str
+    filters: pl.Expr | None = None
+    columns: list[str] | None = None
+
+
+@dataclass(frozen=True)
 class DatasetSpec:
     name: str
-    loader: Callable = lambda p: pl.read_parquet(p)
+    loader: Callable = field(default=lambda path: pl.read_parquet(path))
     path: Path = Path("./data/name.parquet")
+
+
+@dataclass(frozen=True)
+class Dataset:
+    spec: DatasetSpec
+    data: pl.DataFrame
+
+    query: DatasetQuery | None = None
+
+
+def memory_usage(dataset: Dataset) -> int:
+    return int(dataset.data.estimated_size())
 
 
 def estimate_memory_usage(dataset_spec: DatasetSpec) -> int:
@@ -42,28 +62,73 @@ def estimate_memory_usage(dataset_spec: DatasetSpec) -> int:
     return estimate
 
 
-def plan_memory_management(
-    context: Context, max_rss_mb: int = 512
-) -> list[tuple[str, int]]:
+@dataclass(frozen=True)
+class MemoryEstimate:
+    step: int
+    node_id: str
+    dataset: str
+    estimated_mb: int
+
+
+def estimate_memory_requirements(context: Context) -> list[MemoryEstimate]:
+    assert context.dry_run_enabled, (
+        "Memory estimation should only be run in dry run mode"
+    )
     order = context.ordered_nodes
-    memory_plan = []
-    current_rss = 0
-    for node_id in order:
+    print(f"Estimating memory requirements for execution order: {order}")
+    memory_requirements = []
+    for step, node_id in enumerate(order):
+        print(f"Estimating memory for node {node_id} at step {step}")
         node = get_node(node_id, context.node_registry)
         assert node is not None
 
         for dataset_name in node.data_dependencies:
+            print(
+                f"Estimating memory for dataset {dataset_name} required by node {node_id}"
+            )
             dataset_spec = context.data_registry.get_spec(dataset_name)
             dataset_size = estimate_memory_usage(dataset_spec)
-            current_rss += dataset_size
+            print(dataset_size)
 
-        memory_plan.append((node_id, current_rss))
-
-        if current_rss > max_rss_mb * 1024 * 1024:
-            print(
-                f"Warning: Memory usage for node {node_id} exceeds {max_rss_mb} MB (estimated {current_rss / (1024 * 1024):.2f} MB)"
+            memory_requirements.append(
+                MemoryEstimate(
+                    step=step,
+                    node_id=node_id,
+                    dataset=dataset_name,
+                    estimated_mb=int(dataset_size / (1024 * 1024)),
+                )
             )
-    return memory_plan
+
+    return memory_requirements
+
+
+@dataclass(frozen=True)
+class CacheCommand:
+    action: Literal["load", "evict"]
+    dataset: str
+
+
+type CachePlan = list[CacheCommand]
+
+
+def plan_cache(estimates: list[MemoryEstimate], max_mb: int) -> CachePlan:
+    plan = []
+    loaded: dict[str, int] = {}
+    current_rss = 0
+    for estimate in estimates:
+        if current_rss + estimate.estimated_mb < max_mb:
+            plan.append(CacheCommand(action="load", dataset=estimate.dataset))
+            loaded[estimate.dataset] = estimate.estimated_mb
+            current_rss += estimate.estimated_mb
+
+        if current_rss + estimate.estimated_mb >= max_mb:
+            for dataset, size in loaded.items():
+                plan.append(CacheCommand(action="evict", dataset=dataset))
+                current_rss -= size
+            loaded = {}
+            plan.append(CacheCommand(action="load", dataset=estimate.dataset))
+            loaded[estimate.dataset] = estimate.estimated_mb
+            current_rss += estimate.estimated_mb
 
 
 @dataclass
@@ -88,6 +153,7 @@ class Cache:
 def cached_method(
     func: Callable[[DataRegistry, str], pl.DataFrame],
 ) -> Callable[[DataRegistry, str], pl.DataFrame]:
+    @wraps(func)
     def wrapper(self: DataRegistry, name: str) -> pl.DataFrame:
         cached = self._cache.get(name)
         if cached is not None:
@@ -139,6 +205,7 @@ class Context:
 
 
 def register_dependencies(func):
+    @wraps(func)
     def wrapper(self: Node, context: Context) -> list[str] | None:
         if context.dry_run_enabled:
             print(f"Registering dependencies for node {self.id}")
@@ -197,10 +264,10 @@ def make_context() -> Context:
         data_registry.datasets[spec.name] = spec
 
     node_registry: NodeRegistry = {
-        "1": Node(id="1", depends_on=[]),
-        "2": Node(id="2", depends_on=["1"]),
-        "3": Node(id="3", depends_on=["1", "2"]),
-        "4": Node(id="4", depends_on=["1", "3"]),
+        "1": Node(id="1", depends_on=[], data_dependencies=["a"]),
+        "2": Node(id="2", depends_on=["1"], data_dependencies=["b"]),
+        "3": Node(id="3", depends_on=["1", "2"], data_dependencies=["a", "c"]),
+        "4": Node(id="4", depends_on=["1", "3"], data_dependencies=["b", "c"]),
     }
 
     g = nx.DiGraph()
@@ -214,13 +281,6 @@ def main():
     context = make_context()
     with context.dry_run():
         run(context)
-
-    memory_plan = plan_memory_management(context, max_rss_mb=512)
-    print("Memory plan:")
-    for node_id, estimated_rss in memory_plan:
-        print(f"Node {node_id}: estimated RSS {estimated_rss / (1024 * 1024):.2f} MB")
-
-    run(context)
 
 
 if __name__ == "__main__":
